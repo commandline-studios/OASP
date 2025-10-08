@@ -1,0 +1,13 @@
+[package]
+name = "oasp_bt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+dbus = "0.9"
+tokio = { version = "1", features = ["full"] }
+opus = "0.3"
+alsa = "0.6"
+libc = "0.2"
+ctrlc = "3.2"
