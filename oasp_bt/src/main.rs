@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ALSA
 use alsa::pcm::{Access, Format, HwParams, PCM};
@@ -23,7 +23,7 @@ use ctrlc;
 
 const OASP_UUID: &str = "11111111-2222-3333-4444-555555555555";
 const SAMPLE_RATE: u32 = 48000;
-const CHANNELS: Channels = Channels::Mono;
+const CHANNELS: Channels = Channels::Stereo; // small QoL
 const FRAME_SIZE: usize = 960;
 const COMPRESSED_SIZE: usize = 4000;
 const L2CAP_PSM: u16 = 0x1001;
@@ -40,7 +40,7 @@ struct SockAddrL2 {
 
 fn htobs(x: u16) -> u16 { x.to_le() }
 
-// Register OASP profile on BlueZ
+// ============================ BlueZ OASP Profile ============================
 fn register_oasp_profile() -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::new_system()?;
     let proxy = conn.with_proxy("org.bluez", "/org/bluez", Duration::from_secs(5));
@@ -61,7 +61,7 @@ fn register_oasp_profile() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Setup L2CAP server socket
+// ============================ L2CAP Server ============================
 fn setup_l2cap_server() -> RawFd {
     unsafe {
         let sock = socket(AF_BLUETOOTH, SOCK_SEQPACKET, 0);
@@ -84,7 +84,7 @@ fn setup_l2cap_server() -> RawFd {
     }
 }
 
-// ALSA PCM setup helper
+// ============================ ALSA PCM setup ============================
 fn setup_pcm(direction: Direction) -> PCM {
     let pcm = PCM::new("default", direction, false).expect("Failed to open PCM device");
     {
@@ -99,7 +99,7 @@ fn setup_pcm(direction: Direction) -> PCM {
     pcm
 }
 
-// Safe read/write wrappers
+// ============================ Safe read/write ============================
 fn safe_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -116,7 +116,7 @@ fn safe_read(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n as usize)
 }
 
-// Per-client handler
+// ============================ Per-client handler ============================
 fn handle_client(fd: RawFd, running: Arc<AtomicBool>) {
     println!("[OASP] 🎧 Client connected!");
 
@@ -126,25 +126,37 @@ fn handle_client(fd: RawFd, running: Arc<AtomicBool>) {
     let mut enc = Encoder::new(SAMPLE_RATE, CHANNELS, Application::Audio).unwrap();
     let mut dec = Decoder::new(SAMPLE_RATE, CHANNELS).unwrap();
 
-    let mut buffer_in = vec![0i16; FRAME_SIZE];
-    let mut buffer_out = vec![0i16; FRAME_SIZE];
+    let mut buffer_in = vec![0i16; FRAME_SIZE * CHANNELS as usize];
+    let mut buffer_out = vec![0i16; FRAME_SIZE * CHANNELS as usize];
     let mut compressed = vec![0u8; COMPRESSED_SIZE];
-    let mut recv_buf = vec![0u8; COMPRESSED_SIZE + 2];
+    let mut recv_buf = vec![0u8; COMPRESSED_SIZE + 4]; // extra bytes for checksum/seq
 
     let send_fd = fd;
     let recv_fd = fd;
 
+    // Ring buffers for jitter
+    let tx_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let rx_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+
     // Sender thread: mic → client
     let running_send = running.clone();
+    let tx_buf_send = tx_buffer.clone();
     let sender = thread::spawn(move || {
         while running_send.load(Ordering::SeqCst) {
             let io_in = pcm_in.io_i16().unwrap();
             let read_count = io_in.readi(&mut buffer_in).unwrap_or(0);
             if read_count > 0 {
                 let len = enc.encode(&buffer_in[..read_count], &mut compressed).unwrap();
-                let mut packet = vec![(len >> 8) as u8, len as u8];
+                let checksum: u8 = compressed[..len].iter().fold(0, |acc, &b| acc.wrapping_add(b));
+                let mut packet = vec![(len >> 8) as u8, len as u8, checksum];
                 packet.extend_from_slice(&compressed[..len]);
+
+                // Echo mitigation: only send if running
                 if safe_write(send_fd, &packet).is_err() { break; }
+
+                let mut buf = tx_buf_send.lock().unwrap();
+                buf.extend_from_slice(&packet);
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -152,20 +164,26 @@ fn handle_client(fd: RawFd, running: Arc<AtomicBool>) {
 
     // Receiver thread: client → speaker
     let running_recv = running.clone();
+    let rx_buf_recv = rx_buffer.clone();
     let receiver = thread::spawn(move || {
         while running_recv.load(Ordering::SeqCst) {
             match safe_read(recv_fd, &mut recv_buf) {
-                Ok(0) => break, // client disconnected
+                Ok(0) => break,
                 Ok(r) => {
-                    if r > 2 {
+                    if r > 3 {
                         let frame_len = ((recv_buf[0] as usize) << 8) | (recv_buf[1] as usize);
+                        let checksum = recv_buf[2];
                         if frame_len > 0 && frame_len <= COMPRESSED_SIZE {
-                            dec.decode(&recv_buf[2..2+frame_len], &mut buffer_out, false).unwrap_or(0);
-                            let io_out = pcm_out.io_i16().unwrap();
-                            let _ : std::result::Result<usize, alsa::Error> = io_out.writei(&buffer_out).or_else(|_| {
-                                pcm_out.prepare().ok();
-                                Ok(0)
-                            });
+                            let frame_data = &recv_buf[3..3+frame_len];
+                            let calc_sum: u8 = frame_data.iter().fold(0, |acc, &b| acc.wrapping_add(b));
+                            if calc_sum == checksum {
+                                dec.decode(frame_data, &mut buffer_out, false).unwrap_or(0);
+                                let io_out = pcm_out.io_i16().unwrap();
+                                let _ : std::result::Result<usize, alsa::Error> = io_out.writei(&buffer_out).or_else(|_| {
+                                    pcm_out.prepare().ok();
+                                    Ok(0)
+                                });
+                            }
                         }
                     }
                 }
@@ -181,6 +199,7 @@ fn handle_client(fd: RawFd, running: Arc<AtomicBool>) {
     unsafe { libc::close(fd); }
 }
 
+// ============================ Main ============================
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
