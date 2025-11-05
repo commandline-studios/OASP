@@ -1,3 +1,8 @@
 .vscode
-stable
-oasp_bt/targetoasp_client/opus
+stable/
+oasp_bt/target/
+oasp_client/opus/
+*.o
+*.so
+*.log
+*.tmp
